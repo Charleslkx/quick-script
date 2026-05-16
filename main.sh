@@ -1309,7 +1309,7 @@ create_config() {
     short_id=$(generate_short_id)
 
     local default_server="icloud.com"
-    local prefill_servers=("amazon.com" "icloud.com" "microsoft.com")
+    local prefill_servers=("icloud.com" "amazon.com" "academy.nvidia.com")
 
     if [[ -n ${VISION_SERVER_NAME:-} ]]; then
         server_name=$VISION_SERVER_NAME
