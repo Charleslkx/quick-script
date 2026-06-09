@@ -898,8 +898,114 @@ install_dependencies() {
     if ! run_logged_shell "Failed to update package index" "$PKG_UPDATE"; then
         log warn "Package index update failed, continuing to attempt installation"
     fi
-    local packages=(curl tar gzip openssl coreutils util-linux $PKG_EXTRA)
+    local packages=(curl tar gzip openssl coreutils util-linux python3 $PKG_EXTRA)
     run_logged_shell "Failed to install essential dependencies: ${packages[*]}" "$PKG_INSTALL ${packages[*]}"
+}
+
+python3_install_command() {
+    if cmd_exists apt-get; then
+        printf "sudo apt-get update && sudo apt-get install -y python3"
+    elif cmd_exists dnf; then
+        printf "sudo dnf install -y python3"
+    elif cmd_exists yum; then
+        printf "sudo yum install -y python3"
+    elif cmd_exists apk; then
+        printf "sudo apk add --no-cache python3"
+    else
+        printf "Install python3 with your system package manager, then rerun this script."
+    fi
+}
+
+quantumultx_config_from_vless() {
+    local vless_url="$1"
+
+    if ! cmd_exists python3; then
+        return 127
+    fi
+
+    python3 - "$vless_url" <<'PY'
+import sys
+import urllib.parse
+
+
+def first_param(params, *names):
+    for name in names:
+        values = params.get(name)
+        if values and values[0] != "":
+            return values[0]
+    return ""
+
+
+def is_true(value):
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def quote_qx_value(value):
+    return value.replace(",", "%2C")
+
+
+link = sys.argv[1]
+parsed = urllib.parse.urlparse(link)
+if parsed.scheme.lower() != "vless":
+    raise SystemExit("not a vless link")
+if not parsed.username or not parsed.hostname or not parsed.port:
+    raise SystemExit("missing vless username, host, or port")
+
+params = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+host = parsed.hostname
+if ":" in host and not host.startswith("["):
+    host = f"[{host}]"
+
+uuid = urllib.parse.unquote(parsed.username)
+tag = urllib.parse.unquote(parsed.fragment) if parsed.fragment else f"{parsed.hostname}:{parsed.port}"
+network = first_param(params, "type", "network").lower()
+security = first_param(params, "security", "tls").lower()
+sni = first_param(params, "sni", "peer", "servername")
+obfs_host = first_param(params, "host")
+path = first_param(params, "path", "serviceName")
+flow = first_param(params, "flow")
+public_key = first_param(params, "pbk", "publicKey", "reality-base64-pubkey")
+short_id = first_param(params, "sid", "shortId", "reality-hex-shortid")
+
+fields = [
+    f"vless={host}:{parsed.port}",
+    "method=none",
+    f"password={quote_qx_value(uuid)}",
+]
+
+if network == "ws":
+    fields.append("obfs=wss" if security in {"tls", "reality"} else "obfs=ws")
+    if obfs_host or sni:
+        fields.append(f"obfs-host={quote_qx_value(obfs_host or sni)}")
+    if path:
+        fields.append(f"obfs-uri={quote_qx_value(urllib.parse.unquote(path))}")
+elif network == "http":
+    fields.append("obfs=http")
+    if obfs_host or sni:
+        fields.append(f"obfs-host={quote_qx_value(obfs_host or sni)}")
+    if path:
+        fields.append(f"obfs-uri={quote_qx_value(urllib.parse.unquote(path))}")
+elif security in {"tls", "reality"}:
+    fields.append("obfs=over-tls")
+    if sni:
+        fields.append(f"obfs-host={quote_qx_value(sni)}")
+
+if public_key:
+    fields.append(f"reality-base64-pubkey={quote_qx_value(public_key)}")
+if short_id:
+    fields.append(f"reality-hex-shortid={quote_qx_value(short_id)}")
+if flow:
+    fields.append(f"vless-flow={quote_qx_value(flow)}")
+
+allow_insecure = first_param(params, "allowInsecure", "allow_insecure", "skip-cert-verify")
+if is_true(allow_insecure):
+    fields.append("tls-verification=false")
+
+udp = first_param(params, "udp", "udp-relay")
+fields.append(f"udp-relay={'true' if is_true(udp) else 'false'}")
+fields.append(f"tag={quote_qx_value(tag)}")
+print(", ".join(fields))
+PY
 }
 
 ensure_network_stack() {
@@ -1013,8 +1119,18 @@ check_existing_installation() {
             pbk=$(cat "$pub_key_file")
             local link="vless://${uuid}@${server_ip}:${port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=chrome&type=tcp&headerType=none&alpn=h2&pbk=${pbk}&sid=${short_id}&dest=${sni}%3A443#singbox-existing"
             log info "Current link: $link"
+            local quantumultx_config
+            if ! cmd_exists python3; then
+                log warn "Current Quantumult X: unavailable because python3 is not installed"
+                log warn "Install python3 command: $(python3_install_command)"
+            elif quantumultx_config=$(quantumultx_config_from_vless "$link" 2>/dev/null); then
+                log info "Current Quantumult X: $quantumultx_config"
+            else
+                log warn "Current Quantumult X: unavailable because conversion failed"
+            fi
         else
             log warn "Current link: Cannot completely reconstruct (missing public key file)"
+            log warn "Current Quantumult X: Cannot completely reconstruct (missing public key file)"
         fi
 
         local choice
@@ -1552,7 +1668,7 @@ get_country_name() {
 
 
 print_summary() {
-    local ip alias vless_url host_part country
+    local ip alias vless_url host_part country quantumultx_config
     ip=$(get_public_ip)
     # Try to detect server country for a friendly alias label
     country=$(get_country_name "$ip" 2>/dev/null || true)
@@ -1581,6 +1697,17 @@ print_summary() {
     printf "\n"
     printf " %bVLESS Link Share:%b\n" "$C_GREEN" "$C_RESET"
     printf " %b%s%b\n" "$C_YELLOW" "$vless_url" "$C_RESET"
+
+    printf "\n"
+    printf " %bQuantumult X Config:%b\n" "$C_GREEN" "$C_RESET"
+    if ! cmd_exists python3; then
+        printf " %bUnavailable: python3 is not installed%b\n" "$C_YELLOW" "$C_RESET"
+        printf " %bInstall python3:%b %s\n" "$C_YELLOW" "$C_RESET" "$(python3_install_command)"
+    elif quantumultx_config=$(quantumultx_config_from_vless "$vless_url" 2>/dev/null); then
+        printf " %b%s%b\n" "$C_YELLOW" "$quantumultx_config" "$C_RESET"
+    else
+        printf " %bUnavailable: conversion failed%b\n" "$C_YELLOW" "$C_RESET"
+    fi
 
     printf "\n"
     printf " %bConfiguration Paths:%b\n" "$C_GREEN" "$C_RESET"
