@@ -1035,7 +1035,7 @@ ensure_network_stack() {
             log info "Detected IPv4 address: $ipv4"
             return 0
         fi
-        log warn "Attempt ${attempt}  attempt failed to get public IPv4, retrying later..."
+        log warn "Attempt ${attempt} failed to get public IPv4, retrying later..."
         sleep 3
     done
 
@@ -1350,40 +1350,56 @@ debug_singbox() {
     log info "Debug information collection completed"
 }
 
+# Return 0 (in use) / 1 (free or undetectable).
+# When ss is unavailable we cannot detect occupancy, so we assume the port is free.
+port_in_use() {
+    local check_port=$1
+    command -v ss >/dev/null 2>&1 || return 1
+    ss -ltn 2>/dev/null | awk '{print $4}' | tr -d '[]' | awk -F':' '{print $NF}' | grep -qw "$check_port"
+}
+
+# Low-risk HTTPS ports. TLS traffic on these blends in with normal web traffic
+# and they are commonly allowed by cloud security groups (all supported by
+# Cloudflare as HTTPS ports), so we never fall back to a suspicious random port.
+VISION_PORT_CANDIDATES=(443 8443 2053 2083 2087 2096)
+
+# Print the chosen port to stdout and return 0, or return non-zero (printing
+# nothing) when no usable port can be found so the caller can abort.
 generate_port() {
-    local port attempt has_ss preferred requested_port
+    local preferred requested_port selected=""
 
     requested_port="${VISION_PORT:-}"
     if [[ -n "$requested_port" ]]; then
         if [[ "$requested_port" =~ ^[0-9]+$ ]] && [[ "$requested_port" -ge 1 ]] && [[ "$requested_port" -le 65535 ]]; then
-            printf "%s" "$requested_port"
-            return
+            if port_in_use "$requested_port"; then
+                log warn "Specified port VISION_PORT=${requested_port} is already in use by another service; sing-box may fail to start. Free the port or set a different VISION_PORT."
+            fi
+            selected="$requested_port"
+        else
+            log warn "VISION_PORT=${requested_port} is invalid, falling back to a default HTTPS port"
         fi
-        log warn "VISION_PORT=${requested_port} is invalid, falling back to random port"
     fi
 
-    if command -v ss >/dev/null 2>&1; then
-        has_ss=1
-    else
-        has_ss=0
+    # Prefer commonly allowed HTTPS ports to blend in and reduce the probability
+    # of cloud provider security group blocking. We only check local occupancy
+    # here (not the firewall); the caller is reminded to open the inbound rule.
+    if [[ -z "$selected" ]]; then
+        for preferred in "${VISION_PORT_CANDIDATES[@]}"; do
+            if ! port_in_use "$preferred"; then
+                selected="$preferred"
+                break
+            fi
+            log warn "Preferred port ${preferred} is in use, trying the next candidate..."
+        done
     fi
 
-    # Prefer commonly allowed ports to reduce the probability of cloud provider security group blocking
-    for preferred in 443 8443 2053; do
-        if [[ $has_ss -eq 0 ]] || ! ss -ltn 2>/dev/null | awk '{print $4}' | tr -d '[]' | awk -F':' '{print $NF}' | grep -qw "$preferred"; then
-            printf "%s" "$preferred"
-            return
-        fi
-    done
+    if [[ -z "$selected" ]]; then
+        log error "All preferred HTTPS ports (${VISION_PORT_CANDIDATES[*]}) are already in use. Free one of them, or set VISION_PORT to a free HTTPS port, then re-run the installation."
+        return 1
+    fi
 
-    for attempt in $(seq 1 30); do
-        port=$(shuf -i 20000-60000 -n 1)
-        if [[ $has_ss -eq 0 ]] || ! ss -ltn 2>/dev/null | awk '{print $4}' | tr -d '[]' | awk -F':' '{print $NF}' | grep -qw "$port"; then
-            printf "%s" "$port"
-            return
-        fi
-    done
-    printf "44347"
+    log warn "Using port ${selected}. IMPORTANT: open an inbound rule for TCP ${selected} in your cloud security group / firewall — this script does NOT configure it, and clients cannot connect without it."
+    printf "%s" "$selected"
 }
 
 generate_short_id() {
@@ -1414,7 +1430,7 @@ generate_reality_keys() {
 create_config() {
     local config_dir="/etc/sing-box"
     local port uuid short_id server_name
-    port=$(generate_port)
+    port=$(generate_port) || exit 1
 
     if [[ -f /proc/sys/kernel/random/uuid ]]; then
         uuid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null) || uuid=$(cat /proc/sys/kernel/random/uuid)
