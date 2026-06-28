@@ -462,19 +462,26 @@ apply_memory_tuning() {
 }
 
 ensure_memory_dependencies() {
-    if ! is_debian_family; then
+    local kmod_pkg util_pkg procps_pkg
+    if cmd_exists apt-get; then
+        kmod_pkg="kmod"; util_pkg="util-linux"; procps_pkg="procps"
+    elif cmd_exists dnf || cmd_exists yum; then
+        kmod_pkg="kmod"; util_pkg="util-linux"; procps_pkg="procps-ng"
+    elif cmd_exists apk; then
+        kmod_pkg="kmod"; util_pkg="util-linux"; procps_pkg="procps"
+    else
         return 0
     fi
 
     local packages=()
     if ! cmd_exists modprobe; then
-        packages+=("kmod")
+        packages+=("$kmod_pkg")
     fi
     if ! cmd_exists mkswap || ! cmd_exists swapon; then
-        packages+=("util-linux")
+        packages+=("$util_pkg")
     fi
     if ! cmd_exists sysctl; then
-        packages+=("procps")
+        packages+=("$procps_pkg")
     fi
 
     if [[ ${#packages[@]} -gt 0 ]]; then
@@ -482,6 +489,43 @@ ensure_memory_dependencies() {
         eval "$PKG_UPDATE" >/dev/null 2>&1 || true
         eval "$PKG_INSTALL ${packages[*]}" >/dev/null 2>&1 || true
     fi
+}
+
+# Check whether the zram kernel module is available (loaded, built-in, or loadable).
+zram_module_available() {
+    [[ -d /sys/block/zram0 ]] && return 0
+    lsmod 2>/dev/null | grep -q '^zram' && return 0
+    modprobe -n zram >/dev/null 2>&1
+}
+
+# On minimal systems the zram module ships in a separate kernel package and may
+# be missing. Best-effort install of the matching kernel module package.
+install_zram_kernel_module() {
+    local kver
+    kver="$(uname -r)"
+    log info "Attempting to install ZRAM kernel module package..."
+    if cmd_exists apt-get; then
+        eval "$PKG_UPDATE" >/dev/null 2>&1 || true
+        eval "$PKG_INSTALL linux-modules-extra-${kver}" >/dev/null 2>&1 \
+            || eval "$PKG_INSTALL linux-modules-${kver}" >/dev/null 2>&1 \
+            || eval "$PKG_INSTALL linux-image-${kver}" >/dev/null 2>&1 \
+            || true
+    elif cmd_exists dnf; then
+        eval "$PKG_INSTALL kernel-modules-extra" >/dev/null 2>&1 \
+            || eval "$PKG_INSTALL kernel-modules" >/dev/null 2>&1 \
+            || true
+    elif cmd_exists yum; then
+        eval "$PKG_INSTALL kernel-modules-extra" >/dev/null 2>&1 \
+            || eval "$PKG_INSTALL kernel-modules" >/dev/null 2>&1 \
+            || true
+    elif cmd_exists apk; then
+        # Alpine: the zram module ships with the kernel flavor (e.g. linux-virt/linux-lts)
+        eval "$PKG_INSTALL linux-virt" >/dev/null 2>&1 \
+            || eval "$PKG_INSTALL linux-lts" >/dev/null 2>&1 \
+            || true
+    fi
+    # Refresh the module dependency database so the freshly installed module is found.
+    cmd_exists depmod && depmod -a >/dev/null 2>&1 || true
 }
 
 is_zram_active() {
@@ -655,11 +699,20 @@ configure_zram_swap() {
 
     ensure_memory_dependencies
 
+    local module_install_attempted=0
     while [[ $retry_count -lt $max_retries ]]; do
         if modprobe zram num_devices=1 >/dev/null 2>&1; then
             break
         fi
         retry_count=$((retry_count + 1))
+        # On minimal systems the module is often simply not installed; retrying
+        # modprobe alone never succeeds. Install the kernel module package once,
+        # then continue the remaining retries.
+        if [[ $module_install_attempted -eq 0 ]] && ! zram_module_available; then
+            log warn "ZRAM kernel module not found, attempting to install it..."
+            install_zram_kernel_module
+            module_install_attempted=1
+        fi
         log warn "Failed to load ZRAM module, retrying ${retry_count}/${max_retries}..."
         sleep 1
     done
@@ -1655,41 +1708,92 @@ get_public_ip() {
     printf "%s" "$ip"
 }
 
-get_country_name() {
+# Map a raw ISP / org name to a short, well-known abbreviation via keyword match.
+# Matching is case-insensitive substring; unknown ISPs fall through to the raw name.
+normalize_isp() {
+    local raw="${1:-}"
+    [[ -z "$raw" ]] && return 0
+    local lc
+    lc=$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]')
+    case "$lc" in
+        *google*)                         printf 'GCP' ;;
+        *azure*|*microsoft*)              printf 'Azure' ;;
+        *amazon*|*aws*)                   printf 'AWS' ;;
+        *oracle*)                         printf 'OCI' ;;
+        *akamai*|*linode*)                printf 'Akamai' ;;
+        *digitalocean*|*"digital ocean"*) printf 'DO' ;;
+        *hetzner*)                        printf 'Hetzner' ;;
+        *vultr*|*choopa*|*constant*)      printf 'Vultr' ;;
+        *ovh*)                            printf 'OVH' ;;
+        *cloudflare*)                     printf 'CF' ;;
+        *contabo*)                        printf 'Contabo' ;;
+        *leaseweb*)                       printf 'Leaseweb' ;;
+        *scaleway*|*"online sas"*)        printf 'Scaleway' ;;
+        *conoha*|*gmo*)                   printf 'ConoHa' ;;
+        *racknerd*)                       printf 'RackNerd' ;;
+        *bandwagon*|*it7*)                printf 'BWH' ;;
+        *frantech*|*buyvm*)               printf 'BuyVM' ;;
+        *gcore*|*g-core*)                 printf 'Gcore' ;;
+        *alibaba*|*aliyun*)               printf 'Aliyun' ;;
+        *tencent*)                        printf 'Tencent' ;;
+        *huawei*)                         printf 'Huawei' ;;
+        *)                                printf '%s' "$raw" ;;
+    esac
+}
+
+# Sanitize a free-form label (country / ISP name) for safe use in node aliases.
+sanitize_label() {
+    local s="${1:-}"
+    s="${s//,/}"          # drop commas
+    s="${s//./}"          # drop dots
+    s="${s//\//-}"        # slashes to hyphens
+    s="${s// /-}"         # spaces to hyphens
+    s="${s//--/-}"        # collapse double hyphens
+    s="${s#-}"; s="${s%-}"
+    printf "%s" "$s"
+}
+
+# Look up geo info for an IP. Sets GEO_COUNTRY and GEO_ISP (raw, unsanitized).
+lookup_geo_info() {
     local ip="${1:-}"
-    local country=""
+    GEO_COUNTRY=""
+    GEO_ISP=""
 
     if [[ -z "$ip" ]]; then
         return 1
     fi
 
-    # Try ip-api.com (no key required, returns country name)
-    country=$(curl -4 -sf --max-time 5 "http://ip-api.com/json/${ip}?fields=country" 2>/dev/null \
-        | sed -n 's/.*"country":"\([^"]*\)".*/\1/p')
-
-    if [[ -z "$country" ]]; then
-        # Fallback: ipinfo.io
-        country=$(curl -4 -sf --max-time 5 "https://ipinfo.io/${ip}/country" 2>/dev/null | tr -d '[:space:]')
-        # ipinfo.io returns ISO code (e.g. AU), try to keep it if non-empty
+    # Primary: ip-api.com returns both country name and ISP in a single request.
+    local resp
+    resp=$(curl -4 -sf --max-time 5 "http://ip-api.com/json/${ip}?fields=country,isp" 2>/dev/null)
+    if [[ -n "$resp" ]]; then
+        GEO_COUNTRY=$(printf '%s' "$resp" | sed -n 's/.*"country":"\([^"]*\)".*/\1/p')
+        GEO_ISP=$(printf '%s' "$resp" | sed -n 's/.*"isp":"\([^"]*\)".*/\1/p')
     fi
 
-    if [[ -n "$country" ]]; then
-        # Replace spaces with hyphens for URL safety
-        printf "%s" "${country// /-}"
-        return 0
+    # Fallback: ipinfo.io (country returns an ISO code; org carries the ISP/ASN).
+    if [[ -z "$GEO_COUNTRY" ]]; then
+        GEO_COUNTRY=$(curl -4 -sf --max-time 5 "https://ipinfo.io/${ip}/country" 2>/dev/null | tr -d '[:space:]')
+    fi
+    if [[ -z "$GEO_ISP" ]]; then
+        # ipinfo org looks like "AS13335 Cloudflare, Inc." — strip the leading ASN token.
+        GEO_ISP=$(curl -4 -sf --max-time 5 "https://ipinfo.io/${ip}/org" 2>/dev/null | sed 's/^AS[0-9]* //' | tr -d '\r\n')
     fi
 
-    return 1
+    [[ -n "$GEO_COUNTRY" || -n "$GEO_ISP" ]]
 }
 
 
 print_summary() {
-    local ip alias vless_url host_part country quantumultx_config
+    local ip alias vless_url host_part quantumultx_config
     ip=$(get_public_ip)
-    # Try to detect server country for a friendly alias label
-    country=$(get_country_name "$ip" 2>/dev/null || true)
-    if [[ -n "$country" ]]; then
-        alias="${country}-singbox-reality"
+    # Try to detect server country + ISP for a friendly alias label
+    lookup_geo_info "$ip" 2>/dev/null || true
+    local label_parts=()
+    [[ -n "$GEO_COUNTRY" ]] && label_parts+=("$(sanitize_label "$GEO_COUNTRY")")
+    [[ -n "$GEO_ISP" ]] && label_parts+=("$(sanitize_label "$(normalize_isp "$GEO_ISP")")")
+    if [[ ${#label_parts[@]} -gt 0 ]]; then
+        alias="$(IFS=-; printf '%s' "${label_parts[*]}")"
     else
         alias="singbox-reality"
     fi
