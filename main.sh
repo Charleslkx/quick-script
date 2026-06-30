@@ -1679,17 +1679,32 @@ EOF
         log warn "systemd daemon-reload failed"
     fi
 
+    enable_singbox_autostart
+}
+
+enable_singbox_autostart() {
+    if ! command -v systemctl >/dev/null 2>&1; then
+        log warn "systemd environment not detected, cannot enable boot autostart"
+        return 1
+    fi
+
+    if [[ ! -f /etc/systemd/system/sing-box.service ]]; then
+        log error "sing-box.service not found, please run install first"
+        return 1
+    fi
+
     if run_logged "Failed to enable and start sing-box.service" systemctl enable --now sing-box.service; then
         sleep 2
-        if systemctl is-active --quiet sing-box.service 2>/dev/null; then
+        if systemctl is-enabled --quiet sing-box.service 2>/dev/null &&
+            systemctl is-active --quiet sing-box.service 2>/dev/null; then
             log info "sing-box service started and enabled on boot"
         else
-            log error "sing-box service enabled but failed to start, check logs: journalctl -u sing-box -n 50 --no-pager"
+            log error "sing-box service was updated but is not both enabled and active"
             log_service_journal "sing-box" 50
             return 1
         fi
     else
-        log error "sing-box service failed to enable"
+        log error "sing-box service failed to enable or start"
         log_service_journal "sing-box" 50
         return 1
     fi
@@ -1924,12 +1939,15 @@ main() {
             remove_singbox
             install_workflow
             ;;
+        autostart|enable-autostart|--autostart|--enable-autostart)
+            enable_singbox_autostart
+            ;;
         debug|--debug)
             debug_singbox
             ;;
         *)
             log error "Unknown action: $action"
-            log info "Supported commands: install (default), uninstall, reinstall, debug"
+            log info "Supported commands: install (default), uninstall, reinstall, autostart, debug"
             exit 1
             ;;
     esac
